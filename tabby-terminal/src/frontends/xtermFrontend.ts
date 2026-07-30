@@ -1,11 +1,10 @@
 import deepEqual from 'deep-equal'
-import { BehaviorSubject, filter, firstValueFrom, takeUntil } from 'rxjs'
+import { BehaviorSubject, filter, firstValueFrom, fromEvent, takeUntil } from 'rxjs'
 import { Injector } from '@angular/core'
-import { ConfigService, getCSSFontFamily, getWindows10Build, HostAppService, HotkeysService, NotificationsService, Platform, PlatformService, ThemesService, TranslateService } from 'tabby-core'
+import { ConfigService, getCSSFontFamily, getWindows10Build, HostAppService, HotkeysService, Platform, PlatformService, TerminalColorScheme, ThemesService } from 'tabby-core'
 import { Frontend, SearchOptions, SearchState } from './frontend'
 import { Terminal, ITheme } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
-import { ClipboardAddon } from '@xterm/addon-clipboard'
 import { LigaturesAddon } from '@xterm/addon-ligatures'
 import { ISearchOptions, SearchAddon } from '@xterm/addon-search'
 import { WebglAddon } from '@xterm/addon-webgl'
@@ -13,14 +12,19 @@ import { Unicode11Addon } from '@xterm/addon-unicode11'
 import { SerializeAddon } from '@xterm/addon-serialize'
 import { ImageAddon } from '@xterm/addon-image'
 import { CanvasAddon } from '@xterm/addon-canvas'
-import { BaseTerminalProfile, TerminalColorScheme } from '../api/interfaces'
-import { getTerminalBackgroundColor } from '../helpers'
+import { BaseTerminalProfile } from '../api/interfaces'
+import { getXtermBackgroundColor } from '../helpers'
+import { generatePalette } from '../generatePalette'
 import './xterm.css'
 
 const COLOR_NAMES = [
     'black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white',
     'brightBlack', 'brightRed', 'brightGreen', 'brightYellow', 'brightBlue', 'brightMagenta', 'brightCyan', 'brightWhite',
 ]
+
+// How many times to recreate the WebGL renderer after a lost GPU context
+// before giving up and letting xterm fall back to its DOM renderer.
+const MAX_WEBGL_RECOVERY_ATTEMPTS = 3
 
 class FlowControl {
     private blocked = false
@@ -83,14 +87,14 @@ export class XTermFrontend extends Frontend {
     private resizeObserver?: any
     private flowControl: FlowControl
     private pinnedToBottom = true
+    private pendingRendererRecovery = false
+    private rendererRecoveryAttempts = 0
 
     private configService: ConfigService
     private hotkeysService: HotkeysService
     private platformService: PlatformService
     private hostApp: HostAppService
     private themes: ThemesService
-    private notifications: NotificationsService
-    private translate: TranslateService
 
     constructor (injector: Injector) {
         super(injector)
@@ -99,18 +103,11 @@ export class XTermFrontend extends Frontend {
         this.platformService = injector.get(PlatformService)
         this.hostApp = injector.get(HostAppService)
         this.themes = injector.get(ThemesService)
-        this.notifications = injector.get(NotificationsService)
-        this.translate = injector.get(TranslateService)
 
         this.xterm = new Terminal({
             allowTransparency: true,
             allowProposedApi: true,
-            overviewRuler: {
-                width: 8,
-                showBottomBorder: false,
-                showTopBorder: false,
-            },
-            reflowCursorLine: true,
+            overviewRulerWidth: 8,
             windowsPty: process.platform === 'win32' ? {
                 backend: this.configService.store.terminal.useConPTY ? 'conpty' : 'winpty',
                 buildNumber: getWindows10Build(),
@@ -146,15 +143,6 @@ export class XTermFrontend extends Frontend {
         this.xterm.loadAddon(this.fitAddon)
         this.xterm.loadAddon(this.serializeAddon)
         this.xterm.loadAddon(new Unicode11Addon())
-        this.xterm.loadAddon(new ClipboardAddon(undefined, {
-            readText: async () => {
-                return this.platformService.readClipboard()
-            },
-            writeText: async (_, text) => {
-                this.platformService.setClipboard({ text })
-                this.notifications.notice(this.translate.instant('Copied'))
-            },
-        }))
         this.xterm.unicode.activeVersion = '11'
 
         if (this.configService.store.terminal.sixel) {
@@ -224,14 +212,14 @@ export class XTermFrontend extends Frontend {
         //   - wheel/keyboard event listeners (below)
         //   - explicit scrollToBottom() calls
 
-        this.resizeHandler = () => {
+        const doResize = () => {
             try {
                 if (this.xterm.element && getComputedStyle(this.xterm.element).getPropertyValue('height') !== 'auto') {
                     const savedPinned = this.pinnedToBottom
                     const savedViewportY = this.xterm.buffer.active.viewportY
 
                     this.fitAddon.fit()
-                    this.xterm.refresh(0, this.xterm.rows - 1)
+                    this.xtermCore.viewport._refresh()
 
                     if (savedPinned) {
                         this.xtermCore._scrollToBottom()
@@ -241,10 +229,47 @@ export class XTermFrontend extends Frontend {
                         const targetY = Math.min(savedViewportY, maxScroll)
                         this.xterm.scrollToLine(targetY)
                     }
+
+                    // fitAddon.fit() resizes the renderer's drawing buffer,
+                    // which blanks it synchronously, but xterm only repaints on
+                    // the next animation frame — leaving one blank frame that
+                    // reads as flicker during a window drag. Force the repaint
+                    // now (after scrolling settles) to close that gap.
+                    this.xtermCore._renderService?._renderRows(0, this.xterm.rows - 1)
                 }
             } catch (e) {
                 // tends to throw when element wasn't shown yet
                 console.warn('Could not resize xterm', e)
+            }
+        }
+
+        // Rate-limit reflows during a window drag. The window 'resize' event and
+        // the ResizeObserver fire many times per frame; each reflow resizes the
+        // renderer's drawing buffer and re-uploads the glyph atlas texture. At
+        // full frame rate a fast drag issues reflows faster than the GPU can
+        // finish one, so frames composite with the text not yet repainted —
+        // visible as a flicker that only shows up when dragging quickly (slow
+        // drags leave enough time between reflows). Capping the reflow rate and
+        // always running a trailing fit keeps the final size correct without
+        // outrunning the renderer. Tune RESIZE_MIN_INTERVAL if needed.
+        const RESIZE_MIN_INTERVAL = 32
+        let resizePending = false
+        let lastResize = 0
+        const runResize = () => {
+            resizePending = false
+            lastResize = Date.now()
+            doResize()
+        }
+        this.resizeHandler = () => {
+            if (resizePending) {
+                return
+            }
+            resizePending = true
+            const wait = Math.max(0, RESIZE_MIN_INTERVAL - (Date.now() - lastResize))
+            if (wait > 0) {
+                setTimeout(() => requestAnimationFrame(runResize), wait)
+            } else {
+                requestAnimationFrame(runResize)
             }
         }
 
@@ -260,7 +285,6 @@ export class XTermFrontend extends Frontend {
             const altBufferActive = this.xterm.buffer.active.type === 'alternate'
             this.alternateScreenActive.next(altBufferActive)
         })
-
     }
 
     private isAtBottom (): boolean {
@@ -285,8 +309,7 @@ export class XTermFrontend extends Frontend {
         this.configureColors(profile.terminalColorScheme)
 
         if (this.enableWebGL) {
-            this.webGLAddon = new WebglAddon()
-            this.xterm.loadAddon(this.webGLAddon)
+            this.attachWebGLAddon()
             this.platformService.displayMetricsChanged$.pipe(
                 takeUntil(this.destroyed$),
             ).subscribe(() => {
@@ -315,6 +338,12 @@ export class XTermFrontend extends Frontend {
         })
 
         window.addEventListener('resize', this.resizeHandler)
+
+        // The GPU context is often dropped while the app is in the background;
+        // retry recovery once the window is focused again and WebGL is usable.
+        fromEvent(window, 'focus').pipe(
+            takeUntil(this.destroyed$),
+        ).subscribe(() => this.recoverRenderer())
 
         this.resizeHandler()
 
@@ -369,7 +398,7 @@ export class XTermFrontend extends Frontend {
             event.stopPropagation()
         })
 
-        this.resizeObserver = new window['ResizeObserver'](() => setTimeout(() => this.resizeHandler()))
+        this.resizeObserver = new window['ResizeObserver'](() => this.resizeHandler())
         this.resizeObserver.observe(host)
     }
 
@@ -444,12 +473,24 @@ export class XTermFrontend extends Frontend {
         this.xterm.clear()
     }
 
+    resetTerminalModes (): void {
+        // Disable mouse tracking modes (normal, button-event, any-event)
+        // and SGR extended mouse mode to prevent stale mouse tracking
+        // from leaking escape sequences as text after session reconnection
+        this.xterm.write('\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l')
+        // Disable bracketed paste mode
+        this.xterm.write('\x1b[?2004l')
+    }
+
     visualBell (): void {
         if (this.element) {
             this.element.style.animation = 'none'
-            setTimeout(() => {
-                this.element!.style.animation = 'terminalShakeFrames 0.3s ease'
-            })
+            // Force a synchronous reflow so the browser registers the cleared
+            // animation before it is reassigned. Without this, repeated bells
+            // arriving while a shake is still playing coalesce into a single
+            // frame and the animation fails to restart (#11303).
+            void this.element.offsetWidth
+            this.element.style.animation = 'terminalShakeFrames 0.3s ease'
         }
     }
 
@@ -474,7 +515,7 @@ export class XTermFrontend extends Frontend {
     }
 
     private configureColors (scheme: TerminalColorScheme | null): void {
-        const appColorScheme = this.themes._getActiveColorScheme() as TerminalColorScheme
+        const appColorScheme = this.themes._getActiveColorScheme()
 
         scheme = scheme ?? appColorScheme
 
@@ -482,19 +523,23 @@ export class XTermFrontend extends Frontend {
             foreground: scheme.foreground,
             selectionBackground: scheme.selection ?? '#88888888',
             selectionForeground: scheme.selectionForeground ?? undefined,
-            background: getTerminalBackgroundColor(this.configService, this.themes, scheme) ?? '#00000000',
+            background: getXtermBackgroundColor(this.configService, this.themes, scheme),
             cursor: scheme.cursor,
             cursorAccent: scheme.cursorAccent,
-            overviewRulerBorder: scheme.background,
         }
 
         for (let i = 0; i < COLOR_NAMES.length; i++) {
             theme[COLOR_NAMES[i]] = scheme.colors[i]
         }
 
-        theme.scrollbarSliderBackground = theme.brightBlack
-        theme.scrollbarSliderHoverBackground = theme.brightBlack
-        theme.scrollbarSliderHoverBackground = theme.brightBlack
+        if (this.configService.store.terminal.paletteGenerate) {
+            theme.extendedAnsi = generatePalette(
+                scheme.colors,
+                scheme.background,
+                scheme.foreground,
+                this.configService.store.terminal.paletteHarmonious,
+            )
+        }
 
         if (!deepEqual(this.configuredTheme, theme)) {
             this.xterm.options.theme = theme
@@ -517,12 +562,9 @@ export class XTermFrontend extends Frontend {
             }
         })
 
-        this.xtermCore.browser = {
-            ...this.xtermCore.browser,
-            isWindows: this.hostApp.platform === Platform.Windows,
-            isLinux: this.hostApp.platform === Platform.Linux,
-            isMac: this.hostApp.platform === Platform.macOS,
-        }
+        this.xtermCore.browser.isWindows = this.hostApp.platform === Platform.Windows
+        this.xtermCore.browser.isLinux = this.hostApp.platform === Platform.Linux
+        this.xtermCore.browser.isMac = this.hostApp.platform === Platform.macOS
 
         this.xterm.options.fontFamily = getCSSFontFamily(config)
         this.xterm.options.cursorStyle = {
@@ -624,6 +666,78 @@ export class XTermFrontend extends Frontend {
         // eslint-disable-next-line @typescript-eslint/restrict-plus-operands
         this.xterm.options.lineHeight = Math.max(1, (this.configuredFontSize + this.configuredLinePadding * 2) / this.configuredFontSize)
         this.resizeHandler()
+    }
+
+    /**
+     * Redraw the terminal and recover the renderer when its tab is shown again.
+     * Reactivating clears stale renderer state left behind while the tab was
+     * hidden, and flushes any GPU context recovery deferred until now.
+     */
+    reactivate (): void {
+        // An app- or window-level GPU reset can blank the canvas without firing
+        // xterm's per-canvas contextlost event, so pendingRendererRecovery stays
+        // unset. Treat a WebGL frontend that has lost its addon as needing
+        // recovery too, so a shown-but-blank pane always gets its context back
+        // instead of relying on a manual window resize.
+        if (this.pendingRendererRecovery || this.enableWebGL && !this.webGLAddon) {
+            this.pendingRendererRecovery = true
+            this.recoverRenderer()
+        } else {
+            // The pane is shown with a live renderer, so any earlier transient
+            // losses shouldn't count against a future recovery — reset the budget
+            // to avoid permanently downgrading the pane to the DOM renderer.
+            this.rendererRecoveryAttempts = 0
+            this.redraw()
+        }
+    }
+
+    private attachWebGLAddon (): void {
+        const addon = new WebglAddon()
+        // xterm fires this when the GPU drops the canvas context (driver reset,
+        // backgrounded app, too many live contexts).
+        addon.onContextLoss(() => this.onWebGLContextLoss())
+        this.xterm.loadAddon(addon)
+        this.webGLAddon = addon
+    }
+
+    private onWebGLContextLoss (): void {
+        this.webGLAddon?.dispose()
+        this.webGLAddon = undefined
+        this.pendingRendererRecovery = true
+        this.recoverRenderer()
+    }
+
+    /**
+     * Recreate the WebGL renderer after a lost GPU context. A new context can
+     * only be created on a visible, focused canvas, so this no-ops while the
+     * tab is hidden and is retried on reactivation or window focus.
+     */
+    private recoverRenderer (): void {
+        if (!this.pendingRendererRecovery || !this.canRecoverRenderer()) {
+            return
+        }
+        this.pendingRendererRecovery = false
+        if (this.rendererRecoveryAttempts < MAX_WEBGL_RECOVERY_ATTEMPTS) {
+            this.rendererRecoveryAttempts++
+            this.attachWebGLAddon()
+        }
+        // Once the retry budget is exhausted xterm falls back to its DOM renderer.
+        this.redraw()
+    }
+
+    private canRecoverRenderer (): boolean {
+        return !!this.element && this.element.offsetParent !== null && document.hasFocus()
+    }
+
+    private redraw (): void {
+        const renderService = this.xtermCore._renderService
+        renderService?.clear()
+        // handleResize() alone is a no-op when cols/rows are unchanged
+        // resizeHandler() runs a real itAddon.fit() followed
+        // by an unconditional viewport._refresh(),
+        // forcing a full repaint
+        this.resizeHandler()
+        renderService?.handleResize(this.xterm.cols, this.xterm.rows)
     }
 
     private getSelectionAsHTML (): string {
